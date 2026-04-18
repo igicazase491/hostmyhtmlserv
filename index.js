@@ -7,10 +7,12 @@ const WEB_SERVER_PORT = parseInt(process.env.WEB_SERVER_PORT || process.env.PORT
 const DIST_DIR = path.resolve(__dirname, 'dist');
 const DIST_INDEX_PATH = path.join(DIST_DIR, 'index.html');
 const BOOTSTRAP_GLOBAL_NAME = '__SALAMA_BOOTSTRAP__';
-const EDGE_CLIENT_TOKEN_SECRET = String(process.env.EDGE_CLIENT_TOKEN_SECRET || '0x4AAAAAAC75us1KOcKe02Xeeet').trim();
+const EDGE_CLIENT_TOKEN_SECRET = String(process.env.EDGE_CLIENT_TOKEN_SECRET || '0x4AAAAAAC9SNde9gUDyGp6U').trim();
+const EDGE_PROOF_TOKEN_SECRET = String(process.env.EDGE_PROOF_TOKEN_SECRET || '0x4AAAAAAC9SNXfMob6pcPmEKh289ff76eo0x4AAAAAAC9SNde9gUDyGp6U').trim();
 const EDGE_CLIENT_TOKEN_TTL_MS = Math.max(60 * 1000, parseInt(process.env.EDGE_CLIENT_TOKEN_TTL_MS || `${3 * 60 * 60 * 1000}`, 10) || 3 * 60 * 60 * 1000);
-const INIT_UPSTREAM_URL = String(process.env.INIT_UPSTREAM_URL || 'https://formetic-production.up.railway.app').trim();
-const WORKER_SHARED_SECRET = String(process.env.WORKER_SHARED_SECRET || 'TqD08hL6DBEeBoIULuZOx4kspDjPl3ft47g4').trim();
+const EDGE_PROOF_COOKIE_NAME = '__Host-salama_etp';
+const INIT_UPSTREAM_URL = String(process.env.INIT_UPSTREAM_URL || 'https://api-edge-proxy.mysemitgo.workers.dev').trim();
+const WORKER_SHARED_SECRET = String(process.env.WORKER_SHARED_SECRET || '').trim();
 
 const app = express();
 app.set('trust proxy', true);
@@ -31,6 +33,20 @@ const hmacSha256Hex = (secret, message) =>
 const sha256Hex = (value) =>
   crypto.createHash('sha256').update(String(value || ''), 'utf8').digest('hex');
 
+const toBase64Url = (value) =>
+  Buffer.from(value)
+    .toString('base64')
+    .replace(/\+/g, '-')
+    .replace(/\//g, '_')
+    .replace(/=+$/g, '');
+
+const escapeHtmlAttribute = (value) =>
+  String(value || '')
+    .replace(/&/g, '&amp;')
+    .replace(/"/g, '&quot;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
+
 const normalizeIp = (ip) => {
   const s0 = String(ip || '').trim();
   if (!s0) return '';
@@ -41,18 +57,13 @@ const normalizeIp = (ip) => {
 };
 
 const getClientIp = (req) => {
-  const candidates = [
-    req.ip, // uses Express trust-proxy logic
-    String(req.headers['cf-connecting-ip'] || '').trim(),
-    String(req.headers['true-client-ip'] || '').trim(),
-    String(req.headers['x-forwarded-for'] || '').split(',')[0].trim(),
-    req.socket?.remoteAddress || '',
-  ];
-  for (const raw of candidates) {
-    const ip = normalizeIp(raw);
-    if (net.isIP(ip)) return ip;
-  }
-  return '';
+  const cf = String(req.headers['cf-connecting-ip'] || '').trim();
+  if (cf) return normalizeIp(cf);
+  const tci = String(req.headers['true-client-ip'] || '').trim();
+  if (tci) return normalizeIp(tci);
+  const xff = String(req.headers['x-forwarded-for'] || '').trim();
+  if (xff) return normalizeIp(xff.split(',')[0].trim());
+  return normalizeIp(req.socket?.remoteAddress || '');
 };
 
 const parseCookies = (req) => {
@@ -109,6 +120,30 @@ const createEdgeClientToken = (req, options = {}) => {
   return `${encodedPayload}.${signature}`;
 };
 
+const createEdgeProofToken = (req, options = {}) => {
+  if (!EDGE_PROOF_TOKEN_SECRET) return null;
+  const now = Date.now();
+  const userAgent = String(req.headers['user-agent'] || '').slice(0, 200);
+  const tokenUuid = String(options.uuid || '').trim();
+  const payload = {
+    v: 1,
+    typ: 'edge-proof',
+    iat: now,
+    exp: now + EDGE_CLIENT_TOKEN_TTL_MS,
+    jti: crypto.randomBytes(12).toString('hex'),
+    uuid: tokenUuid || null,
+    ip: normalizeIp(getClientIp(req)),
+    uaHash: sha256Hex(userAgent),
+    origin: getRequestOrigin(req) || null,
+  };
+  const iv = crypto.randomBytes(12);
+  const key = crypto.createHash('sha256').update(EDGE_PROOF_TOKEN_SECRET, 'utf8').digest();
+  const cipher = crypto.createCipheriv('aes-256-gcm', key, iv);
+  const ciphertext = Buffer.concat([cipher.update(JSON.stringify(payload), 'utf8'), cipher.final()]);
+  const tag = cipher.getAuthTag();
+  return `${toBase64Url(iv)}.${toBase64Url(ciphertext)}.${toBase64Url(tag)}`;
+};
+
 const serializeBootstrapForHtml = (payload) =>
   JSON.stringify(payload)
     .replace(/</g, '\\u003c')
@@ -117,15 +152,52 @@ const serializeBootstrapForHtml = (payload) =>
     .replace(/\u2028/g, '\\u2028')
     .replace(/\u2029/g, '\\u2029');
 
-const injectBootstrapIntoHtml = (html, payload) => {
+const buildEdgeProofScatterMarkup = (proofToken) => {
+  const token = String(proofToken || '').trim();
+  if (!token) return '';
+  const size = Math.max(24, Math.ceil(token.length / 5));
+  const shards = [];
+  for (let i = 0; i < token.length; i += size) {
+    shards.push(token.slice(i, i + size));
+  }
+  return shards
+    .map((shard, index) => {
+      const id = crypto.randomBytes(2).toString('hex');
+      return `<div style="display:none" aria-hidden="true" data-edge-proof-part="${index}" data-edge-proof-value="${escapeHtmlAttribute(shard)}" data-widget-id="${id}" data-render-mode="hydrated"></div>`;
+    })
+    .join('');
+};
+
+const injectBootstrapIntoHtml = (html, payload, proofToken) => {
   const script = `<script>window.${BOOTSTRAP_GLOBAL_NAME}=${serializeBootstrapForHtml(payload)};</script>`;
-  if (html.includes('</head>')) {
-    return html.replace('</head>', `${script}</head>`);
+  if (html.includes('</head>') && html.includes('</body>')) {
+    const trapToken = String(payload?.edgeClientToken || '').trim();
+    const trapHash = trapToken ? sha256Hex(trapToken) : '';
+    const proofScatter = buildEdgeProofScatterMarkup(proofToken);
+    const trapScatter = trapHash
+      ? [
+          `<div style="display:none" aria-hidden="true" data-analytics-id="${escapeHtmlAttribute(trapHash.slice(0, 12))}" data-build="${escapeHtmlAttribute(trapHash.slice(12, 24))}"></div>`,
+          `<div style="display:none" aria-hidden="true" data-react-checksum="${escapeHtmlAttribute(trapHash.slice(24, 36))}"></div>`,
+          `<div style="display:none" aria-hidden="true" data-client-hint="${escapeHtmlAttribute(trapHash.slice(36, 48))}" data-node-id="${escapeHtmlAttribute(trapHash.slice(48, 60))}"></div>`,
+          `<!-- hydrate:${escapeHtmlAttribute(trapHash.slice(60, 64))}:${escapeHtmlAttribute(trapHash.slice(8, 16))} -->`,
+        ].join('')
+      : '';
+    const withScript = html.replace('</head>', `${script}</head>`);
+    return withScript.replace('</body>', `${proofScatter}${trapScatter}</body>`);
   }
   if (html.includes('</body>')) {
     return html.replace('</body>', `${script}</body>`);
   }
   return `${html}${script}`;
+};
+
+const setEdgeProofCookie = (res, token) => {
+  if (!token) return;
+  const maxAgeSec = Math.max(60, Math.floor(EDGE_CLIENT_TOKEN_TTL_MS / 1000));
+  res.append(
+    'Set-Cookie',
+    `${EDGE_PROOF_COOKIE_NAME}=${encodeURIComponent(token)}; Max-Age=${maxAgeSec}; Path=/; HttpOnly; Secure; SameSite=None`
+  );
 };
 
 const resolvePreferredUuid = (req) => {
@@ -178,11 +250,13 @@ const sendSpaDocument = async (req, res) => {
   const initPayload = await fetchInitPayload(req);
   const resolvedUuid = String(initPayload?.userInfo?.uuid || '').trim();
   const edgeClientToken = createEdgeClientToken(req, { uuid: resolvedUuid });
+  const edgeProofToken = createEdgeProofToken(req, { uuid: resolvedUuid });
   const bootstrap = {
     ...(initPayload && typeof initPayload === 'object' ? initPayload : {}),
     ...(edgeClientToken ? { edgeClientToken } : {}),
   };
-  const html = injectBootstrapIntoHtml(fs.readFileSync(DIST_INDEX_PATH, 'utf8'), bootstrap);
+  const html = injectBootstrapIntoHtml(fs.readFileSync(DIST_INDEX_PATH, 'utf8'), bootstrap, edgeProofToken);
+  setEdgeProofCookie(res, edgeProofToken);
   res
     .set({
       'Cache-Control': 'no-store, no-cache, must-revalidate, private',
@@ -224,17 +298,19 @@ app.use((req, res, next) => {
 });
 
 app.get('/__edge-token', (req, res) => {
-  const token = createEdgeClientToken(req);
-  if (!token) {
+  const trapToken = createEdgeClientToken(req);
+  const proofToken = createEdgeProofToken(req, { uuid: resolvePreferredUuid(req) });
+  if (!trapToken) {
     return res.status(503).json({ error: 'edge_token_unavailable' });
   }
+  setEdgeProofCookie(res, proofToken);
   return res
     .set({
       'Cache-Control': 'no-store, no-cache, must-revalidate, private',
       Pragma: 'no-cache',
       Expires: '0',
     })
-    .json({ token });
+    .json({ token: trapToken });
 });
 
 app.get(/.*/, async (_req, res) => {
