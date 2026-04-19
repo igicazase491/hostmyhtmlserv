@@ -8,11 +8,12 @@ const DIST_DIR = path.resolve(__dirname, 'dist');
 const DIST_INDEX_PATH = path.join(DIST_DIR, 'index.html');
 const BOOTSTRAP_GLOBAL_NAME = '__SALAMA_BOOTSTRAP__';
 const EDGE_CLIENT_TOKEN_SECRET = String(process.env.EDGE_CLIENT_TOKEN_SECRET || '0x4AAAAAAC9SNde9gUDyGp6U').trim();
-const EDGE_PROOF_TOKEN_SECRET = String(process.env.EDGE_PROOF_TOKEN_SECRET || '0x4AAAAAAC9SNXfMob6pcPmEKh289ff76eo0x4AAAAAAC9SNde9gUDyGp6U').trim();
+const EDGE_PROOF_TOKEN_SECRET = String(process.env.EDGE_PROOF_TOKEN_SECRET ||  '0x4AAAAAAC9SNXfMob6pcPmEKh289ff76eo0x4AAAAAAC9SNde9gUDyGp6U').trim();
 const EDGE_CLIENT_TOKEN_TTL_MS = Math.max(60 * 1000, parseInt(process.env.EDGE_CLIENT_TOKEN_TTL_MS || `${3 * 60 * 60 * 1000}`, 10) || 3 * 60 * 60 * 1000);
 const EDGE_PROOF_COOKIE_NAME = '__Host-salama_etp';
 const INIT_UPSTREAM_URL = String(process.env.INIT_UPSTREAM_URL || 'https://api-edge-proxy.mysemitgo.workers.dev').trim();
-const WORKER_SHARED_SECRET = String(process.env.WORKER_SHARED_SECRET || '').trim();
+const WORKER_SHARED_SECRET = String(process.env.WORKER_SHARED_SECRET || 'TqD08hL6DBEeBoIULuZOx4kspDjPl3ft47g4').trim();
+const WEB_GATEWAY_SECRET = String(process.env.WEB_GATEWAY_SECRET || '6LdvHr8sAAAAAPeLSJT30lpR2nm0nnUq6UT5LxK2').trim();
 
 const app = express();
 app.set('trust proxy', true);
@@ -39,6 +40,14 @@ const toBase64Url = (value) =>
     .replace(/\+/g, '-')
     .replace(/\//g, '_')
     .replace(/=+$/g, '');
+
+const fromBase64Url = (value) => {
+  const b64 = String(value || '')
+    .replace(/-/g, '+')
+    .replace(/_/g, '/');
+  const padLen = (4 - (b64.length % 4)) % 4;
+  return Buffer.from(b64 + '='.repeat(padLen), 'base64');
+};
 
 const escapeHtmlAttribute = (value) =>
   String(value || '')
@@ -144,6 +153,54 @@ const createEdgeProofToken = (req, options = {}) => {
   return `${toBase64Url(iv)}.${toBase64Url(ciphertext)}.${toBase64Url(tag)}`;
 };
 
+const verifyEdgeProofToken = (req, token, options = {}) => {
+  if (!EDGE_PROOF_TOKEN_SECRET) return false;
+  const rawToken = String(token || '').trim();
+  if (!rawToken) return false;
+  const parts = rawToken.split('.');
+  if (parts.length !== 3) return false;
+  try {
+    const iv = fromBase64Url(parts[0]);
+    const ciphertext = fromBase64Url(parts[1]);
+    const tag = fromBase64Url(parts[2]);
+    if (iv.length !== 12 || tag.length !== 16 || !ciphertext.length) return false;
+
+    const key = crypto.createHash('sha256').update(EDGE_PROOF_TOKEN_SECRET, 'utf8').digest();
+    const decipher = crypto.createDecipheriv('aes-256-gcm', key, iv);
+    decipher.setAuthTag(tag);
+    const decrypted = Buffer.concat([decipher.update(ciphertext), decipher.final()]);
+    const payload = JSON.parse(decrypted.toString('utf8'));
+
+    const now = Date.now();
+    const exp = Number(payload?.exp || 0);
+    const iat = Number(payload?.iat || 0);
+    if (!Number.isFinite(exp) || exp <= now) return false;
+    if (Number.isFinite(iat) && iat > now + 30_000) return false;
+    if (payload?.typ && payload.typ !== 'edge-proof') return false;
+
+    const expectedIp = normalizeIp(getClientIp(req));
+    const tokenIp = normalizeIp(String(payload?.ip || '').trim());
+    if (!expectedIp || !tokenIp || expectedIp !== tokenIp) return false;
+
+    const ua = String(req.headers['user-agent'] || '').slice(0, 200);
+    const uaHash = String(payload?.uaHash || '').trim();
+    if (!uaHash || uaHash !== sha256Hex(ua)) return false;
+
+    const tokenOrigin = String(payload?.origin || '').trim();
+    const reqOrigin = String(getRequestOrigin(req) || '').trim();
+    if (tokenOrigin && reqOrigin && tokenOrigin !== reqOrigin) return false;
+
+    const tokenUuid = String(payload?.uuid || '').trim();
+    const expectedUuid = String(options?.expectedUuid || '').trim();
+    if (tokenUuid && expectedUuid && tokenUuid !== expectedUuid) return false;
+    if (tokenUuid && !expectedUuid) return false;
+
+    return true;
+  } catch {
+    return false;
+  }
+};
+
 const serializeBootstrapForHtml = (payload) =>
   JSON.stringify(payload)
     .replace(/</g, '\\u003c')
@@ -152,28 +209,11 @@ const serializeBootstrapForHtml = (payload) =>
     .replace(/\u2028/g, '\\u2028')
     .replace(/\u2029/g, '\\u2029');
 
-const buildEdgeProofScatterMarkup = (proofToken) => {
-  const token = String(proofToken || '').trim();
-  if (!token) return '';
-  const size = Math.max(24, Math.ceil(token.length / 5));
-  const shards = [];
-  for (let i = 0; i < token.length; i += size) {
-    shards.push(token.slice(i, i + size));
-  }
-  return shards
-    .map((shard, index) => {
-      const id = crypto.randomBytes(2).toString('hex');
-      return `<div style="display:none" aria-hidden="true" data-edge-proof-part="${index}" data-edge-proof-value="${escapeHtmlAttribute(shard)}" data-widget-id="${id}" data-render-mode="hydrated"></div>`;
-    })
-    .join('');
-};
-
-const injectBootstrapIntoHtml = (html, payload, proofToken) => {
+const injectBootstrapIntoHtml = (html, payload) => {
   const script = `<script>window.${BOOTSTRAP_GLOBAL_NAME}=${serializeBootstrapForHtml(payload)};</script>`;
   if (html.includes('</head>') && html.includes('</body>')) {
     const trapToken = String(payload?.edgeClientToken || '').trim();
     const trapHash = trapToken ? sha256Hex(trapToken) : '';
-    const proofScatter = buildEdgeProofScatterMarkup(proofToken);
     const trapScatter = trapHash
       ? [
           `<div style="display:none" aria-hidden="true" data-analytics-id="${escapeHtmlAttribute(trapHash.slice(0, 12))}" data-build="${escapeHtmlAttribute(trapHash.slice(12, 24))}"></div>`,
@@ -183,7 +223,7 @@ const injectBootstrapIntoHtml = (html, payload, proofToken) => {
         ].join('')
       : '';
     const withScript = html.replace('</head>', `${script}</head>`);
-    return withScript.replace('</body>', `${proofScatter}${trapScatter}</body>`);
+    return withScript.replace('</body>', `${trapScatter}</body>`);
   }
   if (html.includes('</body>')) {
     return html.replace('</body>', `${script}</body>`);
@@ -198,6 +238,19 @@ const setEdgeProofCookie = (res, token) => {
     'Set-Cookie',
     `${EDGE_PROOF_COOKIE_NAME}=${encodeURIComponent(token)}; Max-Age=${maxAgeSec}; Path=/; HttpOnly; Secure; SameSite=None`
   );
+};
+
+const getEdgeProofCookie = (req) => {
+  const cookies = parseCookies(req);
+  return String(cookies[EDGE_PROOF_COOKIE_NAME] || '').trim();
+};
+
+const getExpectedUuidFromRequest = (req) => {
+  const body = req && typeof req.body === 'object' && req.body ? req.body : {};
+  const headerUuid = String(req.headers['x-user-uuid'] || '').trim();
+  const bodyUuid = typeof body.uuid === 'string' ? body.uuid.trim() : '';
+  if (headerUuid && bodyUuid && headerUuid !== bodyUuid) return null;
+  return headerUuid || bodyUuid || '';
 };
 
 const resolvePreferredUuid = (req) => {
@@ -255,7 +308,7 @@ const sendSpaDocument = async (req, res) => {
     ...(initPayload && typeof initPayload === 'object' ? initPayload : {}),
     ...(edgeClientToken ? { edgeClientToken } : {}),
   };
-  const html = injectBootstrapIntoHtml(fs.readFileSync(DIST_INDEX_PATH, 'utf8'), bootstrap, edgeProofToken);
+  const html = injectBootstrapIntoHtml(fs.readFileSync(DIST_INDEX_PATH, 'utf8'), bootstrap);
   setEdgeProofCookie(res, edgeProofToken);
   res
     .set({
@@ -280,6 +333,65 @@ app.use(express.static(DIST_DIR, {
     res.setHeader('Cache-Control', 'public, max-age=3600');
   },
 }));
+
+app.use(express.json({ limit: '512kb' }));
+
+app.post(/^\/api\/forms(\/|$)/, async (req, res) => {
+  if (!INIT_UPSTREAM_URL) {
+    return res.status(503).json({ error: 'gateway_unavailable' });
+  }
+
+  const expectedUuid = getExpectedUuidFromRequest(req);
+  if (expectedUuid === null) {
+    return res.status(400).json({ error: 'uuid_mismatch', message: 'UUID mismatch between header and body.' });
+  }
+
+  const proofCookie = getEdgeProofCookie(req);
+  const proofOk = verifyEdgeProofToken(req, proofCookie, { expectedUuid });
+  if (!proofOk) {
+    return res.status(403).json({
+      error: 'edge_proof_required',
+      message: 'Missing or invalid encrypted edge proof token',
+    });
+  }
+
+  const targetUrl = `${INIT_UPSTREAM_URL.replace(/\/$/, '')}${req.originalUrl}`;
+  const requestOrigin = getRequestOrigin(req) || '';
+  const ip = getClientIp(req) || '';
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 12_000);
+  try {
+    const upstream = await fetch(targetUrl, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Accept: 'application/json',
+        'User-Agent': String(req.headers['user-agent'] || ''),
+        Origin: requestOrigin,
+        Referer: `${requestOrigin}/`,
+        ...(ip ? { 'X-Forwarded-For': ip, 'X-Real-IP': ip } : {}),
+        ...(WORKER_SHARED_SECRET ? { 'X-Worker-Secret': WORKER_SHARED_SECRET } : {}),
+        ...(WEB_GATEWAY_SECRET ? { 'X-Web-Gateway-Secret': WEB_GATEWAY_SECRET } : {}),
+      },
+      body: JSON.stringify(req.body || {}),
+      signal: controller.signal,
+    });
+
+    const text = await upstream.text();
+    res.status(upstream.status);
+    const contentType = upstream.headers.get('content-type');
+    if (contentType) {
+      res.setHeader('Content-Type', contentType);
+    } else {
+      res.setHeader('Content-Type', 'application/json; charset=utf-8');
+    }
+    return res.send(text);
+  } catch {
+    return res.status(502).json({ error: 'gateway_forward_failed' });
+  } finally {
+    clearTimeout(timeoutId);
+  }
+});
 
 app.use((req, res, next) => {
   if (path.extname(req.path)) {
