@@ -29,7 +29,7 @@ const TURNSTILE_ALLOWED_ACTIONS = new Set(
     .filter(Boolean)
 );
 const TURNSTILE_ENFORCE_ACTION =
-  String(process.env.TURNSTILE_ENFORCE_ACTION || 'true').toLowerCase() === 'true' ||
+  String(process.env.TURNSTILE_ENFORCE_ACTION || 'false').toLowerCase() === 'false' ||
   String(process.env.TURNSTILE_ENFORCE_ACTION || '').trim() === '1';
 const RECAPTCHA_SECRET = String(process.env.RECAPTCHA_SECRET || process.env.GOOGLE_RECAPTCHA_SECRET || '6LdvHr8sAAAAAPeLSJT30lpR2nm0nnUq6UT5LxK2').trim();
 const RECAPTCHA_MIN_SCORE = Math.max(0, Math.min(1, Number.parseFloat(process.env.RECAPTCHA_MIN_SCORE || '0.3') || 0.3));
