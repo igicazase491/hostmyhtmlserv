@@ -31,7 +31,7 @@ const TURNSTILE_ALLOWED_ACTIONS = new Set(
 const TURNSTILE_ENFORCE_ACTION =
   String(process.env.TURNSTILE_ENFORCE_ACTION || 'false').toLowerCase() === 'true' ||
   String(process.env.TURNSTILE_ENFORCE_ACTION || '').trim() === '1';
-const RECAPTCHA_SECRET = String(process.env.RECAPTCHA_SECRET || process.env.GOOGLE_RECAPTCHA_SECRET || '6LckS78sAAAAADA_WVXUcifgyxuyBpUiY2Q4l4A5').trim();
+const RECAPTCHA_SECRET = String(process.env.RECAPTCHA_SECRET || process.env.GOOGLE_RECAPTCHA_SECRET || '6LencL8sAAAAABK68lD6ODE0DIRtTcnwNowcspuz').trim();
 const RECAPTCHA_MIN_SCORE = Math.max(0, Math.min(1, Number.parseFloat(process.env.RECAPTCHA_MIN_SCORE || '0.3') || 0.3));
 const RECAPTCHA_MAX_AGE_SEC = Math.max(30, parseInt(process.env.RECAPTCHA_MAX_AGE_SEC || '180', 10) || 180);
 const RECAPTCHA_ALLOWED_HOSTNAMES = new Set(
