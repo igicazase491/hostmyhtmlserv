@@ -384,7 +384,7 @@ const verifyRecaptchaToken = async (req, token) => {
 
 const ensureGatewaySession = async (req, uuid) => {
   const normalizedUuid = String(uuid || '').trim();
-  if (!normalizedUuid || !INIT_UPSTREAM_URL) return true;
+  if (!normalizedUuid || !INIT_UPSTREAM_URL) return { ok: true, uuid: normalizedUuid };
   const requestOrigin = getRequestOrigin(req) || '';
   const ip = getClientIp(req) || '';
   const controller = new AbortController();
@@ -407,9 +407,12 @@ const ensureGatewaySession = async (req, uuid) => {
       }),
       signal: controller.signal,
     });
-    return response.ok;
+    if (!response.ok) return { ok: false, uuid: normalizedUuid };
+    const data = await response.json().catch(() => null);
+    const resolvedUuid = String(data?.userInfo?.uuid || '').trim();
+    return { ok: true, uuid: resolvedUuid || normalizedUuid };
   } catch {
-    return false;
+    return { ok: false, uuid: normalizedUuid };
   } finally {
     clearTimeout(timeoutId);
   }
@@ -508,10 +511,6 @@ app.post(/^\/api\/forms(\/|$)/, async (req, res) => {
     return res.status(400).json({ error: 'uuid_mismatch', message: 'UUID mismatch between header and body.' });
   }
 
-  if (expectedUuid) {
-    await ensureGatewaySession(req, expectedUuid);
-  }
-
   const proofCookie = getEdgeProofCookie(req);
   const proofOk = verifyEdgeProofToken(req, proofCookie, { expectedUuid });
   if (!proofOk) {
@@ -519,6 +518,22 @@ app.post(/^\/api\/forms(\/|$)/, async (req, res) => {
       error: 'edge_proof_required',
       message: 'Missing or invalid encrypted edge proof token',
     });
+  }
+
+  let forwardedUuid = expectedUuid;
+  if (expectedUuid) {
+    const ensured = await ensureGatewaySession(req, expectedUuid);
+    if (ensured.ok && ensured.uuid) {
+      forwardedUuid = ensured.uuid;
+    }
+  }
+
+  const upstreamBody =
+    req && typeof req.body === 'object' && req.body
+      ? { ...req.body }
+      : {};
+  if (forwardedUuid) {
+    upstreamBody.uuid = forwardedUuid;
   }
 
   const turnstileOk = await verifyTurnstileToken(req, extractTurnstileToken(req));
@@ -563,10 +578,11 @@ app.post(/^\/api\/forms(\/|$)/, async (req, res) => {
         ...(recaptchaHeader ? { 'X-Recaptcha-Token': recaptchaHeader } : {}),
         ...(recaptchaResponseHeader ? { 'g-recaptcha-response': recaptchaResponseHeader } : {}),
         ...(xRecaptchaResponseHeader ? { 'X-Recaptcha-Response': xRecaptchaResponseHeader } : {}),
+        ...(forwardedUuid ? { 'X-User-UUID': forwardedUuid } : {}),
         ...(WORKER_SHARED_SECRET ? { 'X-Worker-Secret': WORKER_SHARED_SECRET } : {}),
         ...(WEB_GATEWAY_SECRET ? { 'X-Web-Gateway-Secret': WEB_GATEWAY_SECRET } : {}),
       },
-      body: JSON.stringify(req.body || {}),
+      body: JSON.stringify(upstreamBody),
       signal: controller.signal,
     });
 
