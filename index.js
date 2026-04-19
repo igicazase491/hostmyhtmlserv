@@ -15,7 +15,7 @@ const INIT_UPSTREAM_URL = String(process.env.INIT_UPSTREAM_URL || 'https://api-e
 const WORKER_SHARED_SECRET = String(process.env.WORKER_SHARED_SECRET || 'TqD08hL6DBEeBoIULuZOx4kspDjPl3ft47g4').trim();
 const WEB_GATEWAY_SECRET = String(process.env.WEB_GATEWAY_SECRET || '6LdvHr8sAAAAAPeLSJT30lpR2nm0nnUq6UT5LxK2').trim();
 const TURNSTILE_SECRET = String(process.env.TURNSTILE_SECRET || '0x4AAAAAAC9SNXfMob6pcPmEKh289ff76eo').trim();
-const TURNSTILE_MAX_AGE_SEC = Math.max(30, parseInt(process.env.TURNSTILE_MAX_AGE_SEC || '300', 10) || 300);
+const TURNSTILE_MAX_AGE_SEC = Math.max(30, parseInt(process.env.TURNSTILE_MAX_AGE_SEC || '1000', 10) || 1000);
 const TURNSTILE_ALLOWED_HOSTNAMES = new Set(
   String(process.env.TURNSTILE_ALLOWED_HOSTNAMES || 'fahosfnyyyy.up.railway.app')
     .split(',')
