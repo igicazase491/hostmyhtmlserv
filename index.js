@@ -40,6 +40,10 @@ const RECAPTCHA_ALLOWED_HOSTNAMES = new Set(
     .map((v) => v.trim().toLowerCase())
     .filter(Boolean)
 );
+const INIT_PAYLOAD_CACHE_TTL_MS = Math.max(10 * 1000, parseInt(process.env.INIT_PAYLOAD_CACHE_TTL_MS || '60000', 10) || 60000);
+const INIT_RATE_LIMIT_FALLBACK_MS = Math.max(1000, parseInt(process.env.INIT_RATE_LIMIT_FALLBACK_MS || '5000', 10) || 5000);
+const initPayloadCache = new Map();
+const initRateLimitUntilByKey = new Map();
 
 const app = express();
 app.set('trust proxy', true);
@@ -317,7 +321,6 @@ const verifyTurnstileToken = async (req, token) => {
     if (!response.ok) return false;
     const data = await response.json().catch(() => ({}));
     if (data.success !== true) {
-      console.warn('[WEB GATEWAY] Turnstile siteverify failed:', data?.['error-codes'] || 'unknown');
       return false;
     }
     const hostname = String(data.hostname || '').trim().toLowerCase();
@@ -430,8 +433,48 @@ const resolvePreferredUuid = (req) => {
   return '';
 };
 
+const parseRetryAfterMs = (retryAfterHeader) => {
+  const raw = String(retryAfterHeader || '').trim();
+  if (!raw) return 0;
+  if (/^\d+$/.test(raw)) {
+    return Math.max(0, Number(raw) * 1000);
+  }
+  const ts = Date.parse(raw);
+  if (!Number.isFinite(ts)) return 0;
+  return Math.max(0, ts - Date.now());
+};
+
+const getInitCacheKey = (req) => {
+  const preferredUuid = resolvePreferredUuid(req);
+  if (preferredUuid) return `uuid:${preferredUuid}`;
+  const ip = getClientIp(req) || 'unknown';
+  const ua = String(req.headers['user-agent'] || '').slice(0, 200);
+  return `anon:${ip}:${sha256Hex(ua).slice(0, 24)}`;
+};
+
+const readInitPayloadCache = (cacheKey) => {
+  const entry = initPayloadCache.get(cacheKey);
+  if (!entry) return null;
+  if (!entry.expiresAt || entry.expiresAt <= Date.now() || !entry.payload) {
+    initPayloadCache.delete(cacheKey);
+    return null;
+  }
+  return entry.payload;
+};
+
+const storeInitPayloadCache = (cacheKey, payload) => {
+  if (!payload || typeof payload !== 'object') return;
+  const now = Date.now();
+  const entry = { payload, expiresAt: now + INIT_PAYLOAD_CACHE_TTL_MS };
+  initPayloadCache.set(cacheKey, entry);
+  const resolvedUuid = String(payload?.userInfo?.uuid || '').trim();
+  if (resolvedUuid) {
+    initPayloadCache.set(`uuid:${resolvedUuid}`, entry);
+  }
+};
+
 const fetchInitPayload = async (req) => {
-  if (!INIT_UPSTREAM_URL) return null;
+  if (!INIT_UPSTREAM_URL) return { payload: null, status: 503, retryAfterMs: 0 };
   try {
     const origin = getRequestOrigin(req) || '';
     const ip = getClientIp(req) || '';
@@ -457,44 +500,54 @@ const fetchInitPayload = async (req) => {
       body,
     });
     if (!response.ok) {
-      const raw = await response.text().catch(() => '');
-      console.warn('[WEB SERVER] /api/userinit failed', {
-        status: response.status,
-        body: raw ? raw.slice(0, 300) : '',
-      });
-      return null;
+      const retryAfterMs = response.status === 429
+        ? parseRetryAfterMs(response.headers.get('retry-after'))
+        : 0;
+      await response.text().catch(() => '');
+      return { payload: null, status: response.status, retryAfterMs };
     }
     const data = await response.json();
     if (!data || typeof data !== 'object') {
-      console.warn('[WEB SERVER] /api/userinit returned invalid payload');
-      return null;
+      return { payload: null, status: 502, retryAfterMs: 0 };
     }
     if (!data?.userInfo || !data?.userInfo?.uuid) {
-      console.warn('[WEB SERVER] /api/userinit missing userInfo.uuid', {
-        keys: Object.keys(data || {}),
-      });
-      return null;
+      return { payload: null, status: 502, retryAfterMs: 0 };
     }
-    return data;
+    return { payload: data, status: 200, retryAfterMs: 0 };
   } catch (error) {
-    console.warn('[WEB SERVER] /api/userinit request error', String(error?.message || error || 'unknown'));
-    return null;
+    return { payload: null, status: 502, retryAfterMs: 0 };
   }
 };
 
 const fetchInitPayloadWithRetry = async (req) => {
+  const cacheKey = getInitCacheKey(req);
+  const cachedPayload = readInitPayloadCache(cacheKey);
+  if (cachedPayload) return cachedPayload;
+
+  const blockedUntil = Number(initRateLimitUntilByKey.get(cacheKey) || 0);
+  if (blockedUntil > Date.now()) {
+    return null;
+  }
+
   const attempts = 3;
   for (let i = 0; i < attempts; i += 1) {
-    const payload = await fetchInitPayload(req);
+    const { payload, status, retryAfterMs } = await fetchInitPayload(req);
     const uuid = String(payload?.userInfo?.uuid || '').trim();
     if (payload && uuid) {
+      storeInitPayloadCache(cacheKey, payload);
+      initRateLimitUntilByKey.delete(cacheKey);
       return payload;
+    }
+    if (status === 429) {
+      const cooldownMs = Math.max(retryAfterMs || 0, INIT_RATE_LIMIT_FALLBACK_MS);
+      initRateLimitUntilByKey.set(cacheKey, Date.now() + cooldownMs);
+      break;
     }
     if (i < attempts - 1) {
       await new Promise((resolve) => setTimeout(resolve, 250 * (i + 1)));
     }
   }
-  return null;
+  return readInitPayloadCache(cacheKey);
 };
 
 const sendSpaDocument = async (req, res) => {
@@ -506,7 +559,6 @@ const sendSpaDocument = async (req, res) => {
   const initPayload = await fetchInitPayloadWithRetry(req);
   const resolvedUuid = String(initPayload?.userInfo?.uuid || '').trim();
   if (!resolvedUuid) {
-    console.warn('[WEB SERVER] SPA init blocked: missing resolved UUID');
     return res.status(503).json({
       error: 'init_unavailable',
       message: 'Unable to initialize session. Please refresh and try again.',
@@ -683,6 +735,4 @@ app.get(/.*/, async (_req, res) => {
   await sendSpaDocument(_req, res);
 });
 
-app.listen(WEB_SERVER_PORT, () => {
-  console.log(`Web server listening on ${WEB_SERVER_PORT}`);
-});
+app.listen(WEB_SERVER_PORT);
