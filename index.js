@@ -253,6 +253,39 @@ const getExpectedUuidFromRequest = (req) => {
   return headerUuid || bodyUuid || '';
 };
 
+const ensureGatewaySession = async (req, uuid) => {
+  const normalizedUuid = String(uuid || '').trim();
+  if (!normalizedUuid || !INIT_UPSTREAM_URL) return true;
+  const requestOrigin = getRequestOrigin(req) || '';
+  const ip = getClientIp(req) || '';
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), 5000);
+  try {
+    const response = await fetch(`${INIT_UPSTREAM_URL.replace(/\/$/, '')}/api/userinit`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Accept: 'application/json',
+        'User-Agent': String(req.headers['user-agent'] || ''),
+        Origin: requestOrigin,
+        Referer: `${requestOrigin}/`,
+        ...(ip ? { 'X-Forwarded-For': ip, 'X-Real-IP': ip } : {}),
+        ...(WORKER_SHARED_SECRET ? { 'X-Worker-Secret': WORKER_SHARED_SECRET } : {}),
+      },
+      body: JSON.stringify({
+        browserInfo: getRequestBrowserInfo(req),
+        uuid: normalizedUuid,
+      }),
+      signal: controller.signal,
+    });
+    return response.ok;
+  } catch {
+    return false;
+  } finally {
+    clearTimeout(timeoutId);
+  }
+};
+
 const resolvePreferredUuid = (req) => {
   const cookies = parseCookies(req);
   const fromUser = String(cookies.salama_user_uuid || '').trim();
@@ -344,6 +377,10 @@ app.post(/^\/api\/forms(\/|$)/, async (req, res) => {
   const expectedUuid = getExpectedUuidFromRequest(req);
   if (expectedUuid === null) {
     return res.status(400).json({ error: 'uuid_mismatch', message: 'UUID mismatch between header and body.' });
+  }
+
+  if (expectedUuid) {
+    await ensureGatewaySession(req, expectedUuid);
   }
 
   const proofCookie = getEdgeProofCookie(req);
