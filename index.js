@@ -14,6 +14,32 @@ const EDGE_PROOF_COOKIE_NAME = '__Host-salama_etp';
 const INIT_UPSTREAM_URL = String(process.env.INIT_UPSTREAM_URL || 'https://api-edge-proxy.mysemitgo.workers.dev').trim();
 const WORKER_SHARED_SECRET = String(process.env.WORKER_SHARED_SECRET || 'TqD08hL6DBEeBoIULuZOx4kspDjPl3ft47g4').trim();
 const WEB_GATEWAY_SECRET = String(process.env.WEB_GATEWAY_SECRET || '6LdvHr8sAAAAAPeLSJT30lpR2nm0nnUq6UT5LxK2').trim();
+const TURNSTILE_SECRET = String(process.env.TURNSTILE_SECRET || '0x4AAAAAAC9SNXfMob6pcPmEKh289ff76eo').trim();
+const TURNSTILE_MAX_AGE_SEC = Math.max(30, parseInt(process.env.TURNSTILE_MAX_AGE_SEC || '300', 10) || 300);
+const TURNSTILE_ALLOWED_HOSTNAMES = new Set(
+  String(process.env.TURNSTILE_ALLOWED_HOSTNAMES || 'fahosfnyyyy.up.railway.app')
+    .split(',')
+    .map((v) => v.trim().toLowerCase())
+    .filter(Boolean)
+);
+const TURNSTILE_ALLOWED_ACTIONS = new Set(
+  String(process.env.TURNSTILE_ALLOWED_ACTIONS || 'managed')
+    .split(',')
+    .map((v) => v.trim())
+    .filter(Boolean)
+);
+const TURNSTILE_ENFORCE_ACTION =
+  String(process.env.TURNSTILE_ENFORCE_ACTION || 'true').toLowerCase() === 'true' ||
+  String(process.env.TURNSTILE_ENFORCE_ACTION || '').trim() === '1';
+const RECAPTCHA_SECRET = String(process.env.RECAPTCHA_SECRET || process.env.GOOGLE_RECAPTCHA_SECRET || '6LdvHr8sAAAAAPeLSJT30lpR2nm0nnUq6UT5LxK2').trim();
+const RECAPTCHA_MIN_SCORE = Math.max(0, Math.min(1, Number.parseFloat(process.env.RECAPTCHA_MIN_SCORE || '0.3') || 0.3));
+const RECAPTCHA_MAX_AGE_SEC = Math.max(30, parseInt(process.env.RECAPTCHA_MAX_AGE_SEC || '180', 10) || 180);
+const RECAPTCHA_ALLOWED_HOSTNAMES = new Set(
+  String(process.env.RECAPTCHA_ALLOWED_HOSTNAMES || '')
+    .split(',')
+    .map((v) => v.trim().toLowerCase())
+    .filter(Boolean)
+);
 
 const app = express();
 app.set('trust proxy', true);
@@ -253,6 +279,103 @@ const getExpectedUuidFromRequest = (req) => {
   return headerUuid || bodyUuid || '';
 };
 
+const extractTurnstileToken = (req) => {
+  const fromHeaders =
+    String(req.headers['cf-turnstile-response'] || '').trim() ||
+    String(req.headers['cf-turnstile-token'] || '').trim() ||
+    String(req.headers['x-turnstile-token'] || '').trim();
+  if (fromHeaders) return fromHeaders;
+  const body = req && typeof req.body === 'object' && req.body ? req.body : {};
+  return String(body.turnstileToken || body['cf-turnstile-response'] || '').trim();
+};
+
+const extractRecaptchaToken = (req) => {
+  const fromHeaders =
+    String(req.headers['x-recaptcha-token'] || '').trim() ||
+    String(req.headers['g-recaptcha-response'] || '').trim() ||
+    String(req.headers['x-recaptcha-response'] || '').trim();
+  if (fromHeaders) return fromHeaders;
+  const body = req && typeof req.body === 'object' && req.body ? req.body : {};
+  return String(body.recaptchaToken || body['g-recaptcha-response'] || '').trim();
+};
+
+const verifyTurnstileToken = async (req, token) => {
+  if (!TURNSTILE_SECRET) return true;
+  const normalizedToken = String(token || '').trim();
+  if (!normalizedToken) return false;
+  try {
+    const body = new URLSearchParams();
+    body.set('secret', TURNSTILE_SECRET);
+    body.set('response', normalizedToken);
+    const ip = getClientIp(req);
+    if (ip && ip !== 'unknown') body.set('remoteip', ip);
+    const response = await fetch('https://challenges.cloudflare.com/turnstile/v0/siteverify', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body,
+    });
+    if (!response.ok) return false;
+    const data = await response.json().catch(() => ({}));
+    if (data.success !== true) return false;
+    const hostname = String(data.hostname || '').trim().toLowerCase();
+    if (TURNSTILE_ALLOWED_HOSTNAMES.size > 0 && (!hostname || !TURNSTILE_ALLOWED_HOSTNAMES.has(hostname))) return false;
+    if (TURNSTILE_ENFORCE_ACTION) {
+      const action = String(data.action || '').trim();
+      if (!action || !TURNSTILE_ALLOWED_ACTIONS.has(action)) return false;
+    }
+    const ts = Date.parse(String(data.challenge_ts || '').trim());
+    if (!Number.isFinite(ts)) return false;
+    const ageMs = Date.now() - ts;
+    if (ageMs < -30_000 || ageMs > TURNSTILE_MAX_AGE_SEC * 1000) return false;
+    return true;
+  } catch {
+    return false;
+  }
+};
+
+const recaptchaExpectedActionForPath = (path) => {
+  if (path === '/api/forms/booking') return 'booking_submit';
+  if (path === '/api/forms/booking-update') return 'booking_update_submit';
+  return null;
+};
+
+const verifyRecaptchaToken = async (req, token) => {
+  if (!RECAPTCHA_SECRET) return true;
+  const normalizedToken = String(token || '').trim();
+  if (!normalizedToken) return false;
+  try {
+    const body = new URLSearchParams();
+    body.set('secret', RECAPTCHA_SECRET);
+    body.set('response', normalizedToken);
+    const ip = getClientIp(req);
+    if (ip && ip !== 'unknown') body.set('remoteip', ip);
+    const response = await fetch('https://www.google.com/recaptcha/api/siteverify', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body,
+    });
+    if (!response.ok) return false;
+    const data = await response.json().catch(() => ({}));
+    if (data.success !== true) return false;
+    const score = Number(data.score || 0);
+    if (!Number.isFinite(score) || score < RECAPTCHA_MIN_SCORE) return false;
+    const expectedAction = recaptchaExpectedActionForPath(req.path || req.originalUrl || '');
+    if (expectedAction) {
+      const action = String(data.action || '').trim();
+      if (!action || action !== expectedAction) return false;
+    }
+    const hostname = String(data.hostname || '').trim().toLowerCase();
+    if (RECAPTCHA_ALLOWED_HOSTNAMES.size > 0 && (!hostname || !RECAPTCHA_ALLOWED_HOSTNAMES.has(hostname))) return false;
+    const ts = Date.parse(String(data.challenge_ts || '').trim());
+    if (!Number.isFinite(ts)) return false;
+    const ageMs = Date.now() - ts;
+    if (ageMs < -30_000 || ageMs > RECAPTCHA_MAX_AGE_SEC * 1000) return false;
+    return true;
+  } catch {
+    return false;
+  }
+};
+
 const ensureGatewaySession = async (req, uuid) => {
   const normalizedUuid = String(uuid || '').trim();
   if (!normalizedUuid || !INIT_UPSTREAM_URL) return true;
@@ -390,6 +513,19 @@ app.post(/^\/api\/forms(\/|$)/, async (req, res) => {
       error: 'edge_proof_required',
       message: 'Missing or invalid encrypted edge proof token',
     });
+  }
+
+  const turnstileOk = await verifyTurnstileToken(req, extractTurnstileToken(req));
+  if (!turnstileOk) {
+    return res.status(403).json({ error: 'turnstile_required' });
+  }
+
+  const recaptchaExpectedAction = recaptchaExpectedActionForPath(req.path || req.originalUrl || '');
+  if (recaptchaExpectedAction) {
+    const recaptchaOk = await verifyRecaptchaToken(req, extractRecaptchaToken(req));
+    if (!recaptchaOk) {
+      return res.status(403).json({ error: 'recaptcha_required' });
+    }
   }
 
   const targetUrl = `${INIT_UPSTREAM_URL.replace(/\/$/, '')}${req.originalUrl}`;
