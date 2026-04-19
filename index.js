@@ -15,9 +15,9 @@ const INIT_UPSTREAM_URL = String(process.env.INIT_UPSTREAM_URL || 'https://api-e
 const WORKER_SHARED_SECRET = String(process.env.WORKER_SHARED_SECRET || 'TqD08hL6DBEeBoIULuZOx4kspDjPl3ft47g4').trim();
 const WEB_GATEWAY_SECRET = String(process.env.WEB_GATEWAY_SECRET || '6LdvHr8sAAAAAPeLSJT30lpR2nm0nnUq6UT5LxK2').trim();
 const TURNSTILE_SECRET = String(process.env.TURNSTILE_SECRET || '0x4AAAAAAC9SNXfMob6pcPmEKh289ff76eo').trim();
-const TURNSTILE_MAX_AGE_SEC = Math.max(30, parseInt(process.env.TURNSTILE_MAX_AGE_SEC || '1000', 10) || 1000);
+const TURNSTILE_MAX_AGE_SEC = Math.max(0, parseInt(process.env.TURNSTILE_MAX_AGE_SEC || '0', 10) || 0);
 const TURNSTILE_ALLOWED_HOSTNAMES = new Set(
-  String(process.env.TURNSTILE_ALLOWED_HOSTNAMES || 'fahosfnyyyy.up.railway.app,up.railway.app,railway.app')
+  String(process.env.TURNSTILE_ALLOWED_HOSTNAMES || '')
     .split(',')
     .map((v) => v.trim().toLowerCase())
     .filter(Boolean)
@@ -29,7 +29,7 @@ const TURNSTILE_ALLOWED_ACTIONS = new Set(
     .filter(Boolean)
 );
 const TURNSTILE_ENFORCE_ACTION =
-  String(process.env.TURNSTILE_ENFORCE_ACTION || 'false').toLowerCase() === 'false' ||
+  String(process.env.TURNSTILE_ENFORCE_ACTION || 'false').toLowerCase() === 'true' ||
   String(process.env.TURNSTILE_ENFORCE_ACTION || '').trim() === '1';
 const RECAPTCHA_SECRET = String(process.env.RECAPTCHA_SECRET || process.env.GOOGLE_RECAPTCHA_SECRET || '6LdvHr8sAAAAAPeLSJT30lpR2nm0nnUq6UT5LxK2').trim();
 const RECAPTCHA_MIN_SCORE = Math.max(0, Math.min(1, Number.parseFloat(process.env.RECAPTCHA_MIN_SCORE || '0.3') || 0.3));
@@ -316,17 +316,23 @@ const verifyTurnstileToken = async (req, token) => {
     });
     if (!response.ok) return false;
     const data = await response.json().catch(() => ({}));
-    if (data.success !== true) return false;
+    if (data.success !== true) {
+      console.warn('[WEB GATEWAY] Turnstile siteverify failed:', data?.['error-codes'] || 'unknown');
+      return false;
+    }
     const hostname = String(data.hostname || '').trim().toLowerCase();
     if (TURNSTILE_ALLOWED_HOSTNAMES.size > 0 && (!hostname || !TURNSTILE_ALLOWED_HOSTNAMES.has(hostname))) return false;
     if (TURNSTILE_ENFORCE_ACTION) {
       const action = String(data.action || '').trim();
       if (!action || !TURNSTILE_ALLOWED_ACTIONS.has(action)) return false;
     }
-    const ts = Date.parse(String(data.challenge_ts || '').trim());
-    if (!Number.isFinite(ts)) return false;
-    const ageMs = Date.now() - ts;
-    if (ageMs < -30_000 || ageMs > TURNSTILE_MAX_AGE_SEC * 1000) return false;
+    if (TURNSTILE_MAX_AGE_SEC > 0) {
+      const ts = Date.parse(String(data.challenge_ts || '').trim());
+      if (Number.isFinite(ts)) {
+        const ageMs = Date.now() - ts;
+        if (ageMs < -30_000 || ageMs > TURNSTILE_MAX_AGE_SEC * 1000) return false;
+      }
+    }
     return true;
   } catch {
     return false;
