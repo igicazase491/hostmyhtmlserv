@@ -490,6 +490,7 @@ const fetchInitPayload = async (req) => {
       Origin: origin,
       Referer: `${origin}/`,
       'X-Forwarded-For': ip,
+      'X-Real-IP': ip,
       ...(clientCountry ? { 'X-Client-Country': clientCountry } : {}),
       ...(WORKER_SHARED_SECRET ? { 'X-Worker-Secret': WORKER_SHARED_SECRET } : {}),
       ...(WEB_GATEWAY_SECRET ? { 'X-Web-Gateway-Secret': WEB_GATEWAY_SECRET } : {}),
@@ -558,14 +559,10 @@ const sendSpaDocument = async (req, res) => {
 
   const initPayload = await fetchInitPayloadWithRetry(req);
   const resolvedUuid = String(initPayload?.userInfo?.uuid || '').trim();
-  if (!resolvedUuid) {
-    return res.status(503).json({
-      error: 'init_unavailable',
-      message: 'Unable to initialize session. Please refresh and try again.',
-    });
-  }
-  const edgeClientToken = createEdgeClientToken(req, { uuid: resolvedUuid });
-  const edgeProofToken = createEdgeProofToken(req, { uuid: resolvedUuid });
+  const fallbackUuid = String(resolvePreferredUuid(req) || '').trim();
+  const effectiveUuid = resolvedUuid || fallbackUuid;
+  const edgeClientToken = createEdgeClientToken(req, { uuid: effectiveUuid });
+  const edgeProofToken = createEdgeProofToken(req, { uuid: effectiveUuid });
   const bootstrap = {
     ...(initPayload && typeof initPayload === 'object' ? initPayload : {}),
     ...(edgeClientToken ? { edgeClientToken } : {}),
